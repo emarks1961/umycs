@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "seatable": {
+      "command": "npx",
+      "args": ["-y", "@seatable/mcp-seatable"],
+      "env": {
+        "SEATABLE_SERVER_URL": "${SEATABLE_SERVER_URL}",
+        "SEATABLE_API_TOKEN": "${SEATABLE_API_TOKEN}"
+      }
+    }
+  }
+}
