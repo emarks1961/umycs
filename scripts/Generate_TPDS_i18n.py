@@ -1,4 +1,5 @@
 import base64
+import re
 import requests
 from seatable_api import Base, context
 
@@ -49,6 +50,13 @@ ONEDRIVE_FOLDER      = r'Product Management Data\Technical Product Data Sheets'
 LABELS_TABLE         = 'Labels'   # columns: Key, EN, DE, ... (one column per language)
 DEFAULT_LANG         = 'EN'       # used for rows without a Language and as label fallback
 USE_DATE_TPDS        = False      # False: issue date = today; True: use 'Date TPDS' if filled
+
+# Translation memory (all non-label text of the data sheet)
+TM_TABLE             = 'Translation memory'  # Source, Field, one column per language, Reviewed languages
+ON_MISSING           = 'skip'     # 'skip': do not generate a language with untranslated text
+                                  # 'english': generate anyway, untranslated text stays English
+USE_DRAFTS           = False      # False: only translations ticked in "Reviewed languages"
+                                  # True: also use filled but unreviewed translations
 # -----------------------------------------------------------------------------
 
 
@@ -231,6 +239,110 @@ def file_tag(lang):
     return '' if lang == DEFAULT_LANG else f'_{lang}'
 
 
+# -- TRANSLATION MEMORY -------------------------------------------------------
+# One row per distinct English text: Source, Field, one column per language
+# (DE, FR, ...) and "Reviewed languages". The product code inside a text is
+# stored as {P} so that boilerplate shared by many products is translated once.
+def norm(text):
+    """Lookup key: &#x20; -> space, any run of whitespace -> one space."""
+    return ' '.join(str(text).replace('&#x20;', ' ').replace('&#X20;', ' ').split())
+
+def needs_translation(text):
+    """False for empty text and for pure numbers/units (no word of 3+ letters)."""
+    return bool(re.search(r'[^\W\d_]{3,}', text))
+
+def load_tm():
+    """{normalised source: TM row}; reads the table in pages of 1000."""
+    tm, start = {}, 0
+    try:
+        while True:
+            chunk = base.list_rows(TM_TABLE, start=start, limit=1000)
+            for r in chunk:
+                if r.get('Source'):
+                    tm[norm(r['Source'])] = r
+            if len(chunk) < 1000:
+                break
+            start += 1000
+    except Exception as e:
+        print(f'WARNING: could not read table "{TM_TABLE}": {e}')
+    return tm
+
+TM = load_tm()
+print(f'Translation memory: {len(TM)} entries')
+NEW_SOURCES = {}   # normalised source -> field, for texts the TM has not seen yet
+
+class Translator:
+    """Translates the texts of one document into one language via the TM."""
+    def __init__(self, lang, product_name):
+        self.lang    = lang
+        parts        = re.sub(r'^\s*Nutrycs\s*[®™]?\s*', '', product_name).split()
+        self.short   = ' '.join(parts)                      # 'Nutrycs®  TGT 101' -> 'TGT 101'
+        self.pattern = re.compile(r'\s+'.join(re.escape(p) for p in parts)) if parts else None
+        self.missing = {}    # sources without a usable translation -> field
+        self.drafts  = 0     # unreviewed translations used (USE_DRAFTS)
+
+    def text(self, value, field):
+        if not value or not needs_translation(value):
+            return value
+        src = norm(value)
+        if self.pattern:
+            src = self.pattern.sub('{P}', src)
+        entry = TM.get(src)
+        if entry is None:
+            NEW_SOURCES.setdefault(src, field)
+            self.missing[src] = field
+            return value
+        out      = entry.get(self.lang)
+        reviewed = self.lang in (entry.get('Reviewed languages') or [])
+        if not out or not (reviewed or USE_DRAFTS):
+            self.missing[src] = field
+            return value
+        if not reviewed:
+            self.drafts += 1
+        return str(out).replace('{P}', self.short)
+
+TEXT_KEYS = {
+    'ProductDescription': 'Product description', 'Application': 'Application',
+    'Composition': 'Composition', 'Storage': 'Storage', 'ShelfLife': 'Shelf life',
+    'PackagingSize': 'Packaging size', 'GMOInformation': 'GMO information',
+    'GMOadditionalnotes': 'GMO additional information', 'DisclaimerLastLine': 'Disclaimer',
+}
+LINES_KEYS = {
+    'ComplianceLabellingLines': 'Compliance & Labelling', 'HealthSafetyLines': 'Health & Safety',
+    'QualityFoodSafetyCertificationsLines': 'Quality & Food Safety Certifications',
+    'DisclaimerJustifiedLines': 'Disclaimer',
+}
+for _n in range(1, 5):
+    for _suffix, _label in (('Title', 'title'), ('HeaderA', 'header A'),
+                            ('HeaderB', 'header B'), ('Additionalnotes', 'additional notes')):
+        TEXT_KEYS[f'Table{_n}{_suffix}'] = f'Table {_n} {_label}'
+
+def translate_payload(payload, tr):
+    """Translate the data-sheet texts of a payload in place (labels are handled separately)."""
+    for key, field in TEXT_KEYS.items():
+        payload[key] = tr.text(payload.get(key, ''), field)
+    for key, field in LINES_KEYS.items():
+        payload[key] = [tr.text(v, field) for v in payload.get(key, [])]
+    for n in range(1, 5):
+        payload[f'Table{n}'] = [
+            {'Property': tr.text(r['Property'], f'Table {n} property'),
+             'Value':    tr.text(r['Value'],    f'Table {n} value')}
+            for r in payload.get(f'Table{n}', [])
+        ]
+
+def flush_new_sources():
+    """Add the texts the TM has not seen yet, so they can be translated."""
+    if not NEW_SOURCES:
+        return
+    new_rows = [{'Source': src, 'Field': field} for src, field in NEW_SOURCES.items()]
+    try:
+        for i in range(0, len(new_rows), 500):
+            base.batch_append_rows(TM_TABLE, new_rows[i:i + 500])
+        print(f'[tm] {len(new_rows)} new text(s) added to "{TM_TABLE}"')
+    except Exception as e:
+        print(f'[tm] WARNING: could not write to "{TM_TABLE}": {e}')
+
+
 # -- STEP 4: Process each row -------------------------------------------------
 for row in rows:
     product_name = s(row, 'Product name')
@@ -283,6 +395,18 @@ for row in rows:
             'Table4':                          table_rows(row, 4, 14),
             'Table4Additionalnotes':           s(row, 'Table 4 Additional notes'),
         }
+        if lang != DEFAULT_LANG:
+            tr = Translator(lang, product_name)
+            translate_payload(payload_data, tr)
+            if tr.drafts:
+                print(f'  NOTE: {tr.drafts} unreviewed (draft) translation(s) used [{lang}]')
+            if tr.missing:
+                print(f'  {len(tr.missing)} untranslated or unreviewed text(s) [{lang}]')
+                if ON_MISSING == 'skip':
+                    print(f'  Skipping {lang}: fill the {lang} column in "{TM_TABLE}", tick {lang} under '
+                          f'"Reviewed languages", then run again')
+                    all_ok = False
+                    continue
         payload_data.update(labels_for(lang))
         payload_data.update(issue_dates(row, lang))
 
@@ -367,6 +491,8 @@ for row in rows:
     else:
         print('  WARNING: not every language was generated - row left ticked for a re-run')
 
+
+flush_new_sources()
 
 # [log patch]
 log_generation(base, 'TPDS', generated)
