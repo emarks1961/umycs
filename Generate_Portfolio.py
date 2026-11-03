@@ -28,7 +28,10 @@ def log_generation(base, doc_type, count, source='script'):
 
 import os as _os
 
-TEMPLATE_DIR = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), 'templates')
+# Folder of this script; falls back to the working directory if __file__ is unavailable
+_script_dir  = _os.path.dirname(_os.path.abspath(globals().get('__file__', 'x'))) \
+               if '__file__' in globals() else _os.getcwd()
+TEMPLATE_DIR = _os.path.join(_script_dir, 'templates')
 
 def load_template_bytes(filename):
     """Read a base64-encoded base docx from the templates/ folder next to this script."""
